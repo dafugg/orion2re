@@ -51,7 +51,7 @@ namespace NETMOX {
         constexpr uint32_t O2GD_MAGIC = 0x4447324F;
         constexpr uint16_t O2GD_VERSION = 1;
         constexpr uint16_t O2GD_HEADER_SIZE = 20;
-        constexpr uint32_t NATIVE_SNAPSHOT_VERSION_TAG = 0x4A4E324F; // O2NJ
+        constexpr uint32_t NATIVE_SNAPSHOT_VERSION_TAG = 0x4B4E324F; // O2NK
 
         void Write_Combat_Destination(NETPROTO::Packet_Writer_& writer, int16_t position) {
             SERIAL::Write_Star_Destination(writer, game::Destination_At_Row(game::current_state, position));
@@ -680,7 +680,7 @@ namespace NETMOX {
 
         SERIAL::Write_Planet_Block(state, writer);
 
-        SERIAL::Write_Keyed_Colony_Block(state, writer);
+        SERIAL::Write_Keyed_Colony_Block(state, writer, SERIAL::e_colony_block_layout::packet);
 
         writer.Write_Int16(state.ship_count);
         writer.Write_Uint32(state.next_ship_id);
@@ -888,7 +888,8 @@ namespace NETMOX {
             }
         }
 
-        if (!SERIAL::Read_Keyed_Colony_Block(state, reader)) {
+        const auto colony_flags = reader.Read_Uint16();
+        if (!SERIAL::Read_Keyed_Colony_Block(state, reader, colony_flags, nullptr, SERIAL::e_colony_block_layout::packet)) {
             exitm::Exit_With_Message("invalid broadcast colony records");
         }
 
@@ -908,8 +909,8 @@ namespace NETMOX {
                                                          : SERIAL::Read_Ship_Packet(reader, ship);
             if (!decoded) exitm::Exit_With_Message("invalid broadcast ship record");
             const auto id = ship.id;
-            if (id != game::NO_SHIP &&
-                (i >= received_ship_count || id.id >= next_ship_id || received_ships.Row(id) >= 0)) {
+            if (id == game::NO_SHIP ? (i < received_ship_count && ship.status != 5)
+                                  : (i >= received_ship_count || id.id >= next_ship_id || received_ships.Row(id) >= 0)) {
                 exitm::Exit_With_Message("invalid broadcast ship identity");
             }
             received_ships.Replace_Row(i, ship);
@@ -978,7 +979,7 @@ namespace NETMOX {
         state.ship_records = std::move(received_ships);
         state.ship_count = received_ship_count;
         state.next_ship_id = next_ship_id;
-        for (auto& [id, colony] : state.colonies) game::Import_Colony_Queue(state, colony);
+        game::received_combat_order.reset();
         game::Import_Leader_Ship_Assignments(state);
         for (int i = 0; i < EVENT_COUNT; ++i) SERIAL::Import_Event_Ship_Target(state, EVENTS::event_data[i], i);
         for (auto& message : MSG_::msgs) SERIAL::Import_Notice_Ship_Target(state, message);
@@ -1335,7 +1336,7 @@ namespace NETMOX {
         for (const auto& [id, colony] : game::current_state.colonies) {
             if (colony.owner == MOX::PLAYER_NUM) {
                 assert(colony.id == id);
-                SERIAL::Write_Colony(writer, colony, &game::current_state);
+                SERIAL::Write_Colony_Packet(writer, game::current_state, colony);
             }
         }
 
@@ -1703,7 +1704,7 @@ namespace NETMOX {
         auto colony_count = state.colonies.size();
         for (;;) {
             s_colony colony{};
-            if (!SERIAL::Read_Colony_Update(reader, colony)) return false;
+            if (!SERIAL::Read_Colony_Packet_Update(reader, colony)) return false;
             const auto id = colony.id;
             if (id == game::NO_COLONY) break;
             if (id.id >= next_id || (!colony_orders.empty() && id <= colony_orders.back().id) || colony.owner != player_idx) return false;
@@ -1734,15 +1735,10 @@ namespace NETMOX {
             if (id < 0 || id >= max_ships || (!ship_orders.empty() && id <= ship_orders.back().first)) return false;
             s_ship_data ship{};
             if (!SERIAL::Read_Ship_Packet(reader, ship, state) || ship.owner != player_idx || ship.status == 5) return false;
-            if (ship.id != game::NO_SHIP && !ordered_ids.insert(ship.id).second) return false;
+            if (ship.id == game::NO_SHIP || !ordered_ids.insert(ship.id).second) return false;
             ship_orders.emplace_back(id, ship);
         }
 
-        std::map<game::id_ship, int16_t> live_ship_rows;
-        for (int16_t row = 0; row < state.ship_count; ++row) {
-            const auto key = game::current_state.ship_records[row].id;
-            if (key != game::NO_SHIP && !live_ship_rows.try_emplace(key, row).second) return false;
-        }
         std::vector<int16_t> local_rows(max_ships, -1);
         std::vector<bool> claimed(MAX_SHIPS);
         const auto can_claim = [&](int row) {
@@ -1753,12 +1749,11 @@ namespace NETMOX {
         };
         for (const auto& [sender_row, ship] : ship_orders) {
             const auto key = ship.id;
-            if (const auto existing = live_ship_rows.find(key); existing != live_ship_rows.end()) {
-                const auto row = existing->second;
+            if (const auto row = game::Ship_Row(state, key); row >= 0) {
                 if (game::current_state.ship_records[row].owner != player_idx || game::current_state.ship_records[row].status == 5) return false;
                 local_rows[sender_row] = row;
                 claimed[row] = true;
-            } else if (key != game::NO_SHIP && key.id % MAX_PLAYERS != player_idx) {
+            } else if (key.id % MAX_PLAYERS != player_idx) {
                 return false;
             }
         }
@@ -1779,19 +1774,13 @@ namespace NETMOX {
             }
             ship_extent = std::max<int16_t>(ship_extent, row + 1);
             const auto key = ship.id;
-            if (key != game::NO_SHIP) next_ship_id = std::max(next_ship_id, key.id + 1);
+            next_ship_id = std::max(next_ship_id, key.id + 1);
         }
 
-        for (auto& colony : colony_orders) {
-            for (auto& product : colony.producing) {
-                if (!COLBLDG::Colony_Production_Is_Queued_Ship(product)) continue;
-                const auto sender_row = game::Legacy_Queued_Ship_Row(product);
-                if (sender_row < 0 || sender_row >= max_ships || local_rows[sender_row] < 0) return false;
-                const auto order = std::ranges::lower_bound(ship_orders, sender_row, {}, &decltype(ship_orders)::value_type::first);
-                if (order == ship_orders.end() || order->first != sender_row) return false;
-                product = order->second.id == game::NO_SHIP
-                    ? COLONY_PRODUCTION_QUEUED_SHIP_BASE - local_rows[sender_row]
-                    : game::Queued_Ship_Product(order->second.id);
+        for (const auto& colony : colony_orders) {
+            for (const auto product : colony.producing) {
+                const auto key = game::Queued_Ship_Key(product);
+                if (key != game::NO_SHIP && !ordered_ids.contains(key)) return false;
             }
         }
 
@@ -1901,9 +1890,11 @@ namespace NETMOX {
         RUSS::Mox_Update();
 
         for (int16_t i = 0; i < state.ship_count; ++i) {
-            if (!claimed[i] && game::current_state.ship_records[i].owner == player_idx && game::current_state.ship_records[i].status != 5) {
-                game::current_state.ship_records[i].officer_index = -1;
-                SHIPS::Kill_Ship(i);
+            if (claimed[i]) continue;
+            auto& ship = state.ship_records[i];
+            if (ship.owner == player_idx && ship.status != 5) {
+                ship.officer_index = -1;
+                SHIPS::Kill_Ship(ship);
             }
         }
         for (int16_t i = state.ship_count; i < ship_extent; ++i) {
@@ -2096,7 +2087,7 @@ namespace NETMOX {
                         if (existing != state.colonies.end() && existing->second.planet_id != planet_idx) return;
                         if (existing == state.colonies.end() && old_colony == game::NO_COLONY && state.colonies.size() >= MAX_COLONIES) return;
                         s_colony colony{};
-                        if (!combat_ship_sync::Read_Colony_With_Id(reader, colony, new_colony)) return;
+                        if (!SERIAL::Read_Colony_Packet_With_Id(reader, colony, new_colony)) return;
                         if (colony.planet_id != planet_idx) return;
                         state.colonies.insert_or_assign(colony.id, colony);
                         for (auto& queue : state.colony_reservations) std::erase(queue, new_colony);
@@ -2111,9 +2102,11 @@ namespace NETMOX {
 
             // 7. Read Ships
             combat_ship_sync::s_batch participants;
-            if (!combat_ship_sync::Read_Batch(reader, state, combat_ship_sync::e_batch_kind::participants, participants))
+            if (!combat_ship_sync::Read_Batch(reader, state, participants))
                 exitm::Exit_With_Message("invalid combat ship list");
-            combat_ship_sync::Apply_Batch(state, participants, true);
+            auto order = combat_ship_sync::Participant_Order(participants, *destination);
+            combat_ship_sync::Apply_Batch(state, participants);
+            game::received_combat_order = std::move(order);
         }
 
         // 8. Finalize synchronization state
@@ -2207,7 +2200,7 @@ namespace NETMOX {
                 char p_climate = static_cast<char>(reader.Read_Uint8());
 
                 s_colony colony{};
-                if (!combat_ship_sync::Read_Colony_With_Id(reader, colony, target_colony_id)) return;
+                if (!SERIAL::Read_Colony_Packet_With_Id(reader, colony, target_colony_id)) return;
                 if (colony.planet_id != planet_idx) return;
                 if (old_colony != target_colony_id) state.colonies.erase(old_colony);
                 state.colonies.insert_or_assign(colony.id, colony);
@@ -2219,9 +2212,11 @@ namespace NETMOX {
 
             // 6. Read Ships
             combat_ship_sync::s_batch participants;
-            if (!combat_ship_sync::Read_Batch(reader, state, combat_ship_sync::e_batch_kind::participants, participants))
+            if (!combat_ship_sync::Read_Batch(reader, state, participants))
                 exitm::Exit_With_Message("invalid combat ship list");
-            combat_ship_sync::Apply_Batch(state, participants, true);
+            auto order = combat_ship_sync::Participant_Order(participants, *destination);
+            combat_ship_sync::Apply_Batch(state, participants);
+            game::received_combat_order = std::move(order);
         }
 
         // 7. Finalize synchronization state
@@ -2327,7 +2322,7 @@ namespace NETMOX {
                         const auto existing = state.colonies.find(new_colony);
                         if (existing != state.colonies.end() && existing->second.planet_id != combat_planet_idx) return;
                         if (existing == state.colonies.end() && old_colony == game::NO_COLONY && state.colonies.size() >= MAX_COLONIES) return;
-                        if (!combat_ship_sync::Read_Colony_With_Id(reader, colony, new_colony)) return;
+                        if (!SERIAL::Read_Colony_Packet_With_Id(reader, colony, new_colony)) return;
                         if (colony.planet_id != combat_planet_idx) return;
                     }
 
@@ -2352,13 +2347,15 @@ namespace NETMOX {
                 // 6. Unpack Ships and Process Casualties
                 auto& ship_state = game::current_state;
                 combat_ship_sync::s_batch survivors;
-                if (!combat_ship_sync::Read_Batch(reader, ship_state, combat_ship_sync::e_batch_kind::survivors, survivors))
+                if (!combat_ship_sync::Read_Batch(reader, ship_state, survivors))
                     exitm::Exit_With_Message("invalid combat survivor list");
-                for (const auto row : combat_ship_sync::Casualty_Rows(ship_state, survivors, combat_star_id, attacker_id, defender_id)) {
-                    ship_state.ship_records[row].officer_index = -1;
-                    SHIPS::Kill_Ship(row);
+                for (const auto key : combat_ship_sync::Casualty_Keys(ship_state, survivors, combat_star_id, attacker_id, defender_id)) {
+                    if (auto* ship = game::Find_Ship(ship_state, key)) {
+                        ship->officer_index = -1;
+                        SHIPS::Kill_Ship(*ship);
+                    }
                 }
-                combat_ship_sync::Apply_Batch(ship_state, survivors, false);
+                combat_ship_sync::Apply_Batch(ship_state, survivors);
                 RUSS::Mox_Update();
             }
         }
@@ -2462,22 +2459,22 @@ namespace NETMOX {
                 writer.Write_Char(planet.climate);
 
                 if (planet.colony_id != game::NO_COLONY) {
-                    combat_ship_sync::Write_Colony_Fields(writer, state, state.colonies.at(planet.colony_id));
+                    SERIAL::Write_Colony_Packet_Fields(writer, state, state.colonies.at(planet.colony_id));
                 }
             }
 
             RUSS::Mox_Update();
 
-            writer.Write_Int16((int16_t)game::current_state.ship_count);
-
-            if (game::current_state.ship_count > 0) {
-                for (int16_t i = 0; i < (int16_t)game::current_state.ship_count; i++) {
-                    if (game::Ship_Orbit_Row(game::current_state, game::current_state.ship_records[i].position) == star_id && game::current_state.ship_records[i].status != 5) {
-                        if (game::current_state.ship_records[i].owner == player_id || game::current_state.ship_records[i].owner == target_player_id) {
-                            writer.Write_Int16(i);
-                            SERIAL::Write_Ship_Packet(writer, game::current_state.ship_records[i]);
-                        }
-                    }
+            writer.Write_Int16(state.ship_count);
+            const auto* order = game::Received_Combat_Order(state, star_id);
+            // Result rows are placement hints, not the order used in battle.
+            for (int16_t row = 0; row < state.ship_count; ++row) {
+                const auto& ship = state.ship_records[row];
+                if (ship.id == game::NO_SHIP || (order && !order->ranks.contains(ship.id)) ||
+                    ship.status == 5 || game::Ship_Orbit_Row(state, ship.position) != star_id) continue;
+                if (ship.owner == player_id || ship.owner == target_player_id) {
+                    writer.Write_Int16(row);
+                    SERIAL::Write_Ship_Packet(writer, ship);
                 }
             }
 
@@ -2555,7 +2552,7 @@ namespace NETMOX {
                 writer.Write_Uint32(planet_idx.id);
                 writer.Write_Int8(game::current_state.planets.at(planet_idx).planet_type);
                 writer.Write_Char(game::current_state.planets.at(planet_idx).climate);
-                combat_ship_sync::Write_Colony_Fields(writer, state, colony);
+                SERIAL::Write_Colony_Packet_Fields(writer, state, colony);
             }
 
             RUSS::Mox_Update();
@@ -2638,7 +2635,7 @@ namespace NETMOX {
                     writer.Write_Char(planet.climate);
 
                     if (planet.colony_id != game::NO_COLONY) {
-                        combat_ship_sync::Write_Colony_Fields(writer, state, state.colonies.at(planet.colony_id));
+                        SERIAL::Write_Colony_Packet_Fields(writer, state, state.colonies.at(planet.colony_id));
                     }
                 }
             }

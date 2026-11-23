@@ -18,12 +18,10 @@ namespace INITSHIP {
     extern uint8_t landers_size_class;
     extern s_lander_ship_uses_stealth lander_ship_uses_stealth;
 
-    void __cdecl Repair_Ships_At_Colonies();
+    void Repair_Ships_At_Colonies(const game::s_view& world);
 
-    /** Fully repairs a ship and restores its weapon and special-device state.
-     * @param ship_idx Index of the ship to repair.
-     */
-    void __cdecl Repair_Ship_Full(int16_t ship_idx);
+    /** Fully repairs a ship and restores its weapon and special-device state. */
+    void Repair_Ship_Full(s_ship_data& ship);
 
     void __cdecl Init_Ship_Designs(int16_t player_idx);
 
@@ -182,8 +180,8 @@ namespace INITSHIP {
     int16_t __cdecl Best_Missile_Damage_Special(int16_t player_idx);
 
     /** Checks whether a ship carries a weapon type in any slot.
-     * @param ship_index Index of the ship to inspect.
+     * @param ship Ship record to inspect.
      * @param weapon_type Weapon type id to search for.
      */
-    int16_t __cdecl Ship_Has_Weapon(int16_t ship_index, int16_t weapon_type);
+    bool Ship_Has_Weapon(const s_ship_data& ship, int16_t weapon_type);
 } // namespace INITSHIP

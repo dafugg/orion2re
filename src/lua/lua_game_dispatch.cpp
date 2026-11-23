@@ -9,6 +9,7 @@ using game::current_state;
 #include <string>
 
 #include "lua/lua_game_internal.h"
+#include "lua/lua_game_ship_identity.h"
 #include "lua/lua_mod_runtime.h"
 #include "game/techinit.h"
 
@@ -23,8 +24,6 @@ namespace orion2re::lua::game {
     namespace {
 
         std::uint64_t next_event_sequence_ = 1;
-        std::uint64_t ship_world_ = 1;
-        std::uint64_t last_ship_world_ = 1;
         thread_local std::uint32_t authoritative_population_growth_depth_ = 0;
 
         bool Setup_Callback_Allowed_() {
@@ -239,14 +238,10 @@ namespace orion2re::lua::game {
         }
     }
 
-    std::uint64_t internal::Ship_World() {
-        return ship_world_;
-    }
-
     void Reset_Semantic_State() {
         next_event_sequence_ = 1;
         // Aborted loads restore the active stamp but do not reuse a staged stamp.
-        ship_world_ = ++last_ship_world_;
+        Advance_Ship_World();
         internal::Advance_Topology_Generation();
     }
 
@@ -258,7 +253,7 @@ namespace orion2re::lua::game {
         replacement->prior_event_sequence = next_event_sequence_;
         replacement->prior_topology_generation =
             internal::Topology_Generation();
-        replacement->prior_ship_world = ship_world_;
+        replacement->prior_ship_world = Ship_World();
         replacement->active = true;
         Reset_Semantic_State();
     }
@@ -312,7 +307,7 @@ namespace orion2re::lua::game {
             return;
         }
         next_event_sequence_ = replacement->prior_event_sequence;
-        ship_world_ = replacement->prior_ship_world;
+        Restore_Ship_World(replacement->prior_ship_world);
         internal::Restore_Topology_Generation(
             replacement->prior_topology_generation);
         replacement->active = false;
